@@ -1,0 +1,53 @@
+# Python cache and environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Local input, extracted data, and generated output
+input/
+output/
+converted*/
+test_output/
+yw3/
+ywb1/
+*_content/
+
+# Extracted game-resource formats
+*.xc
+RES.bin
+*.prm
+*.mtn2
+*.mtn3
+*.mtninf
+*.mtninf2
+*.mtm2
+*.mtm3
+*.mtminf
+*.mtminf2
+*.imm2
+*.imm3
+*.imminf
+*.imminf2
+*.atr
+*.cmn
+*.mbn
+*.mtr
+*.txp
+*.xi
+*.lkat
+*.sil
+
+# Private reference material
+*_ja.md
+memo.md
+MINF2Converter-1.py
+
+# Temporary, editor, and operating-system files
+*.tmp
+*.bak
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
