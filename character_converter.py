@@ -4,7 +4,10 @@
 Implemented standalone conversions:
 
 * ``mtn3`` -> ``mtn2``
+* bundled ``mtn3``/``mtm3``/``imm3`` -> individual v2 animations
 * ``mtninf2`` -> individual ``mtninf`` files
+* ordinary ``mtminf2``/``imminf2`` -> individual v1 INF files
+* validated byte-preserving existing v2-animation/v1-INF copies
 * character ``prm`` -> YWB1-compatible ``prm``
 * character ``lkat`` -> YWB1-compatible ``lkat``
 * validated, byte-identical character ``sil`` copy
@@ -26,6 +29,7 @@ import math
 import os
 import shutil
 import struct
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -66,7 +70,8 @@ def crc32(raw: bytes) -> int:
 def level5_decompress(data: bytes) -> bytes:
     """Decompress the Level-5 kinds needed by character resources.
 
-    Supported kinds are LZ10 (1), Huffman4 (2), Huffman8 (3), and RLE (4).
+    Supported kinds are uncompressed (0), LZ10 (1), Huffman4 (2),
+    Huffman8 (3), and RLE (4).
     Character MTN uses kind 3, while two source XPCK archives use kind 2 for
     their compressed RES.bin.
     """
@@ -75,6 +80,10 @@ def level5_decompress(data: bytes) -> bytes:
     header = u32(data, 0)
     kind = header & 7
     output_size = header >> 3
+
+    if kind == 0:
+        require(output_size <= len(data) - 4, "Uncompressed Level-5 block ends prematurely")
+        return data[4 : 4 + output_size]
 
     if kind == 1:
         source = 4
@@ -299,8 +308,10 @@ def convert_character_prm(data: bytes) -> bytes:
     The character layout identifies the generation-specific block with the
     outer-header offsets at 0x0C and 0x10.  YW3 ends that 0x4C-byte block in
     sixteen zero bytes, while YWB1 replaces those bytes with an eight-byte
-    compatibility marker.  XPVB/XPVI and their compressed payloads are kept
-    byte-for-byte so no normal or skin-weight rounding is introduced.
+    compatibility marker.  A small number of YW3 archives already contain
+    the verified 0x44-byte legacy block; preserve those PRMs after checking
+    their marker and name ranges.  XPVB/XPVI and their compressed payloads
+    are kept byte-for-byte so no normal or skin-weight rounding is introduced.
     """
 
     require(len(data) >= PRM_OUTER_HEADER_SIZE, "PRM header is too short")
@@ -318,6 +329,27 @@ def convert_character_prm(data: bytes) -> bytes:
         "PRM generation-difference block range is invalid",
     )
     compatibility_size = compatibility_end - compatibility_start
+    if compatibility_size == PRM_YWB1_COMPATIBILITY_SIZE:
+        require(
+            data[compatibility_end - 8 : compatibility_end]
+            == PRM_COMPATIBILITY_REPLACEMENT,
+            "Legacy PRM compatibility marker is unsupported",
+        )
+        name_offset = u32(data, 0x30)
+        material_offset = u32(data, 0x38)
+        require(
+            compatibility_end <= name_offset <= material_offset <= len(data),
+            "Legacy PRM name or material-name range is invalid",
+        )
+        require(
+            name_offset + u32(data, 0x34) <= material_offset,
+            "Legacy PRM name length exceeds its region",
+        )
+        require(
+            material_offset + u32(data, 0x3C) <= len(data),
+            "Legacy PRM material-name length exceeds the file",
+        )
+        return data
     require(
         compatibility_size == PRM_YW3_COMPATIBILITY_SIZE,
         "PRM generation-difference block size is not the YW3 value 0x4C "
@@ -432,11 +464,15 @@ def convert_character_sil(data: bytes) -> bytes:
 
 ATR_MAGIC = b"ATRC01\0\0"
 ATR_HEADER_SIZE = 0x0C
+# These values are Level-5 headers, not layout IDs: (0x3C << 3) | kind.
+# Keep the historical constant for callers that imported it, but do not use
+# its old fixed compressed-file lengths as a structural constraint.
 ATR_LAYOUT_SIZES = {0x01E3: 40, 0x01E4: 36}
+ATR_RAW_SIZE = 0x3C
 
 
 def convert_character_atr(data: bytes) -> bytes:
-    """Validate one character ATR and return a byte-identical copy."""
+    """Validate the variable-length compressed ATR and copy it unchanged."""
 
     require(len(data) >= 0x10, "ATR header is too short")
     require(data[:8] == ATR_MAGIC, "ATR magic is not ATRC01")
@@ -444,13 +480,16 @@ def convert_character_atr(data: bytes) -> bytes:
         u32(data, 0x08) == ATR_HEADER_SIZE,
         f"ATR header size is not 0x{ATR_HEADER_SIZE:X}",
     )
-    layout = u16(data, 0x0C)
-    require(layout in ATR_LAYOUT_SIZES, f"Unsupported ATR layout: 0x{layout:04X}")
+    compressed = data[ATR_HEADER_SIZE:]
     require(
-        len(data) == ATR_LAYOUT_SIZES[layout],
-        "ATR size does not match the layout identifier "
-        f"(expected: {ATR_LAYOUT_SIZES[layout]}, actual: {len(data)})",
+        u32(compressed, 0) & 7 in {3, 4},
+        "ATR payload is not Huffman8/RLE-compressed",
     )
+    require(u32(compressed, 0) >> 3 == ATR_RAW_SIZE, "ATR declared raw size is not 0x3C")
+    require(len(data) % 4 == 0, "ATR size is not 4-byte aligned")
+    raw = level5_decompress(compressed)
+    require(len(raw) == ATR_RAW_SIZE, "Decompressed ATR size is not 0x3C")
+    require(u32(raw, 0) == ATR_RAW_SIZE, "ATR inner-header size is not 0x3C")
     return data
 
 
@@ -476,10 +515,9 @@ def convert_character_mtr(data: bytes) -> bytes:
 
     raw_offsets = (u16(data, 0x0A), u16(data, 0x10), u16(data, 0x12))
     nonzero_offsets = [offset for offset in raw_offsets if offset]
-    require(
-        raw_offsets == tuple(nonzero_offsets + [0] * (3 - len(nonzero_offsets))),
-        "MTR LUTC offsets contain an internal gap",
-    )
+    # The three fields identify independent LUT slots, not a packed list.
+    # B1 y133800/y191000/y191010 use (0, 92, 2128); an absent first LUT
+    # therefore does not make the later two invalid.  Preserve slot identity.
     require(
         nonzero_offsets == sorted(set(nonzero_offsets)),
         "MTR LUTC offsets are not in ascending order or contain duplicates",
@@ -521,6 +559,7 @@ def convert_character_mtr(data: bytes) -> bytes:
 
 MBN_SIZE = 0xA8
 MBN_FLOAT_COUNT = 39
+MBN_VERIFIED_FLAGS = {4, 5, 12}
 
 
 def convert_character_mbn(data: bytes) -> bytes:
@@ -529,8 +568,8 @@ def convert_character_mbn(data: bytes) -> bytes:
     require(len(data) == MBN_SIZE, f"MBN size is not 0x{MBN_SIZE:X}")
     require(u32(data, 0x00) != 0, "MBN node-ID CRC32 is zero")
     require(
-        u32(data, 0x08) in {4, 12},
-        "MBN flags are not one of the verified values 4 or 12",
+        u32(data, 0x08) in MBN_VERIFIED_FLAGS,
+        "MBN flags are not one of the verified values 4, 5, or 12",
     )
     values = struct.unpack_from(f"<{MBN_FLOAT_COUNT}f", data, 0x0C)
     require(all(math.isfinite(value) for value in values), "MBN contains a non-finite float value")
@@ -540,16 +579,32 @@ def convert_character_mbn(data: bytes) -> bytes:
 XI_MAGIC = b"IMGC00\0\0"
 XI_DATA_OFFSET = 0x48
 XI_FORMAT_ETC1 = 0x1B
+# Each tuple is (header bytes at 0x0B..0x0F, stored bytes per 8x8 tile).
+# Both layouts occur in native YWB1 character XC archives. Other image formats
+# remain unsupported even if their storage can be decoded structurally.
+XI_VERIFIED_FORMATS = {
+    XI_FORMAT_ETC1: (bytes.fromhex("01 01 04 20 00"), 32),
+    0x1C: (bytes.fromhex("01 01 08 40 00"), 64),
+}
+XI_COMPRESSION_KINDS = {0, 1, 2, 3, 4}
 
 
 def convert_character_xi(data: bytes) -> bytes:
-    """Validate one ETC1 character XI image and copy it unchanged."""
+    """Validate one native-compatible character XI image and copy unchanged.
+
+    Offset 0x34 stores the encoded tile-table length, while 0x38 stores its
+    four-byte-aligned region length (not necessarily an exact duplicate).
+    The tile table contains one u16 index per 8x8 tile. Its references must
+    cover exactly the contiguous tile blocks stored in the decoded image.
+    """
 
     require(len(data) >= XI_DATA_OFFSET + 8, "XI header or image region is too short")
     require(data[:8] == XI_MAGIC, "XI magic is not IMGC00")
     require(u16(data, 0x08) == 0x30, "XI inner-header size is not 0x30")
-    require(data[0x0A] == XI_FORMAT_ETC1, "XI image format is not the verified ETC1 value (0x1B)")
-    require(data[0x0B:0x10] == bytes.fromhex("01 01 04 20 00"), "XI format fields are unsupported")
+    image_format = data[0x0A]
+    require(image_format in XI_VERIFIED_FORMATS, f"Unsupported XI image format: 0x{image_format:02X}")
+    format_fields, tile_bytes = XI_VERIFIED_FORMATS[image_format]
+    require(data[0x0B:0x10] == format_fields, "XI format fields do not match the verified image format")
     width, height = struct.unpack_from("<2H", data, 0x10)
     require(
         width > 0 and height > 0 and width % 8 == 0 and height % 8 == 0,
@@ -566,7 +621,10 @@ def convert_character_xi(data: bytes) -> bytes:
     require(data[0x40:0x48] == bytes(8), "XI reserved region at 0x40 is not zero-filled")
 
     tile_size = u32(data, 0x34)
-    require(tile_size > 4 and u32(data, 0x38) == tile_size, "XI tile-table size is invalid")
+    require(
+        tile_size > 4 and u32(data, 0x38) == ((tile_size + 3) & ~3),
+        "XI aligned tile-table size is invalid",
+    )
     image_size = u32(data, 0x3C)
     require(image_size > 4, "XI image-data size is invalid")
     tile_start = XI_DATA_OFFSET
@@ -579,7 +637,7 @@ def convert_character_xi(data: bytes) -> bytes:
     require(data[image_end:] == bytes(len(data) - image_end), "XI trailing padding is not zero-filled")
 
     tile_data = data[tile_start:tile_end]
-    require(u32(tile_data, 0) & 7 == 2, "XI tile table is not Huffman4-compressed")
+    require(u32(tile_data, 0) & 7 in XI_COMPRESSION_KINDS, "XI tile table has an unsupported compression kind")
     raw_tiles = level5_decompress(tile_data)
     require(
         len(raw_tiles) == width * height // 32,
@@ -587,11 +645,18 @@ def convert_character_xi(data: bytes) -> bytes:
     )
 
     image_data = data[image_start:image_end]
-    require(u32(image_data, 0) & 7 == 1, "XI image data is not LZ10-compressed")
+    require(u32(image_data, 0) & 7 in XI_COMPRESSION_KINDS, "XI image data has an unsupported compression kind")
     raw_image = level5_decompress(image_data)
     require(
-        raw_image and len(raw_image) % 32 == 0 and len(raw_image) <= width * height // 2,
-        "Decompressed XI ETC1 image-data size is invalid",
+        raw_image and len(raw_image) % tile_bytes == 0
+        and len(raw_image) <= width * height // 64 * tile_bytes,
+        "Decompressed XI image-data size does not match the verified tile format",
+    )
+    stored_tiles = len(raw_image) // tile_bytes
+    indices = struct.unpack(f"<{len(raw_tiles) // 2}H", raw_tiles)
+    require(
+        set(indices) == set(range(stored_tiles)),
+        "XI tile-table references do not cover exactly the stored image tiles",
     )
     return data
 
@@ -990,6 +1055,249 @@ def convert_mtn3(data: bytes) -> bytes:
 
 
 @dataclass(frozen=True)
+class CharacterAnimationLayout:
+    magic: bytes
+    source_extension: str
+    target_extension: str
+    header_size: int
+    count_fields: int
+    track_count: int
+    used_size_offset: int
+    raw_base_offset: int
+    target_work_offset: int
+    target_name_offset: int
+    target_compressed_offset: int
+
+
+CHARACTER_ANIMATION_LAYOUTS = {
+    ".mtn3": CharacterAnimationLayout(b"XMTN", ".mtn3", ".mtn2", 44, 4, 4, 0x10, 0x14, 8, 0x28, 0x58),
+    ".mtm3": CharacterAnimationLayout(b"XMTM", ".mtm3", ".mtm2", 32, 2, 2, 0x10, 0x14, 16, 0x24, 0x54),
+    ".imm3": CharacterAnimationLayout(b"XIMA", ".imm3", ".imm2", 40, 4, 4, 0x14, 0x10, 8, 0x24, 0x54),
+}
+
+
+def split_character_animation3(data: bytes, extension: str) -> list[bytes]:
+    """Split bundled generation-3 headers and their shared decoded block.
+
+    Header offsets 0x04/06 and 0x0C are relative to the end of *all*
+    consecutive headers, whereas the raw-base field is relative to the one
+    shared decoded block. Returning conventional single-entry sources keeps
+    the existing standalone MTN API and its binary output unchanged.
+    """
+
+    layout = CHARACTER_ANIMATION_LAYOUTS[extension]
+    headers: list[bytes] = []
+    position = 0
+    while data[position : position + 4] == layout.magic:
+        require(position + layout.header_size <= len(data), f"{extension} bundled header is truncated")
+        headers.append(data[position : position + layout.header_size])
+        position += layout.header_size
+    require(headers, f"{extension} magic does not match")
+    body_base = position
+    ranges: list[tuple[int, int, int, int, int]] = []
+    previous_end = body_base
+    for index, header in enumerate(headers):
+        descriptor_count = sum(struct.unpack_from(f"<{layout.count_fields}I", header, 0x18))
+        name_start = body_base + u32(header, 0x0C)
+        track_start = body_base + u16(header, 4)
+        descriptor_start = body_base + u16(header, 6)
+        descriptor_end = descriptor_start + 16 * descriptor_count
+        require(name_start == previous_end, f"{extension} entry {index}: name/body regions are not contiguous")
+        require(track_start == name_start + 48, f"{extension} entry {index}: track-table offset is invalid")
+        require(descriptor_start == track_start + 2 * layout.track_count,
+                f"{extension} entry {index}: descriptor-table offset is invalid")
+        require(descriptor_end <= len(data) - 4, f"{extension} entry {index}: descriptor table is out of range")
+        hash_count = u32(header, 0x28) if extension == ".mtn3" else descriptor_count
+        raw_prefix_size = hash_count * 4 + layout.track_count * 8
+        require(u32(header, 8) == raw_prefix_size,
+                f"{extension} entry {index}: hash/track-prefix size is inconsistent")
+        ranges.append((name_start, descriptor_end, hash_count, raw_prefix_size, descriptor_count))
+        previous_end = descriptor_end
+
+    shared = level5_decompress(data[previous_end:])
+    outputs: list[bytes] = []
+    raw_previous_end = 0
+    for index, (header, region) in enumerate(zip(headers, ranges)):
+        name_start, descriptor_end, _, prefix_size, _ = region
+        raw_start = u32(header, layout.raw_base_offset)
+        used_size = u32(header, layout.used_size_offset)
+        raw_end = raw_start + prefix_size + used_size
+        require(raw_previous_end <= raw_start <= raw_end <= len(shared),
+                f"{extension} entry {index}: bundled decoded-data range is invalid")
+        require(not any(shared[raw_previous_end:raw_start]),
+                f"{extension} entry {index}: unclaimed decoded-data gap is not zero-filled")
+        raw_previous_end = raw_end
+        if len(headers) == 1 and raw_start == 0:
+            # The verified body offsets already have their standalone
+            # values. Avoid a needless decode/recompress/decode cycle;
+            # the v2 builder below still takes exactly used_size bytes.
+            outputs.append(data)
+            continue
+        standalone = bytearray(header)
+        struct.pack_into("<H", standalone, 4, 48)
+        struct.pack_into("<H", standalone, 6, 48 + layout.track_count * 2)
+        struct.pack_into("<I", standalone, 0x0C, 0)
+        struct.pack_into("<I", standalone, layout.raw_base_offset, 0)
+        standalone.extend(data[name_start:descriptor_end])
+        standalone.extend(level5_lz10_compress(shared[raw_start:raw_end]))
+        outputs.append(bytes(standalone))
+    require(not any(shared[raw_previous_end:]), f"{extension}: decoded trailing padding is not zero-filled")
+    return outputs
+
+
+def convert_character_animation3(data: bytes, extension: str) -> list[bytes]:
+    """Convert each MTN3/MTM3/IMM3 logical animation to an individual v2 file."""
+
+    require(extension in CHARACTER_ANIMATION_LAYOUTS, f"Unsupported animation extension: {extension}")
+    layout = CHARACTER_ANIMATION_LAYOUTS[extension]
+    # Preserve the established standalone MTN output (including compression)
+    # when no consecutive second XMTN header is present.
+    if extension == ".mtn3" and data[44:48] != b"XMTN":
+        return [convert_mtn3(data)]
+    outputs: list[bytes] = []
+    for source in split_character_animation3(data, extension):
+        if extension == ".mtn3":
+            outputs.append(convert_mtn3(source))
+            continue
+        counts = struct.unpack_from(f"<{layout.count_fields}I", source, 0x18)
+        descriptor_count = sum(counts)
+        hash_count = descriptor_count
+        descriptor_start = layout.header_size + 48 + 2 * layout.track_count
+        raw = level5_decompress(source[descriptor_start + 16 * descriptor_count:])
+        used_size = u32(source, layout.used_size_offset)
+        prefix_size = hash_count * 4 + layout.track_count * 8
+        require(prefix_size + used_size <= len(raw), f"{extension} data length is out of range")
+        pointer_start = 12 + hash_count * 4
+        records_start = pointer_start + 2 * layout.track_count
+        target_descriptor_start = records_start + 8 * layout.track_count
+        target_data_start = target_descriptor_start + 16 * descriptor_count
+        require(records_start + 8 * (layout.track_count - 1) <= 0xFFFF,
+                f"{extension} track-record offset exceeds the 16-bit range")
+        block = bytearray(struct.pack("<3I", 12, pointer_start, target_descriptor_start))
+        block.extend(raw[:hash_count * 4])
+        for i in range(layout.track_count):
+            block.extend(p16(records_start + 8 * i))
+        block.extend(raw[hash_count * 4:prefix_size])
+        for i in range(descriptor_count):
+            a, b, value, extra = struct.unpack_from("<4I", source, descriptor_start + 16 * i)
+            require(extra == 0, f"{extension} descriptor {i} has an unknown fourth value: 0x{extra:X}")
+            require(all(offset < used_size for offset in (a, b, value)),
+                    f"{extension} descriptor {i} points outside the used-data region")
+            block.extend(struct.pack("<4I", a + target_data_start, b + target_data_start,
+                                     value + target_data_start, 0))
+        block.extend(raw[prefix_size:prefix_size + used_size])
+        work_size = len(block) + descriptor_count * 84
+        output = bytearray(layout.magic + bytes(layout.target_work_offset - 4))
+        output.extend(struct.pack("<3I", work_size, layout.target_name_offset, layout.target_compressed_offset))
+        output.extend(source[0x18:0x18 + 4 * layout.count_fields])
+        require(len(output) == layout.target_name_offset, "Internal animation name offset mismatch")
+        output.extend(source[layout.header_size:layout.header_size + 48])
+        require(len(output) == layout.target_compressed_offset, "Internal animation compressed offset mismatch")
+        output.extend(level5_lz10_compress(bytes(block)))
+        outputs.append(bytes(output))
+    return outputs
+
+
+def convert_mtn3_entries(data: bytes) -> list[bytes]:
+    return convert_character_animation3(data, ".mtn3")
+
+
+def convert_simple_inf2(data: bytes, extension: str) -> list[bytes]:
+    """Convert MTMINF2/IMMINF2 only when every logical entry has no tail."""
+
+    require(extension in {".mtminf2", ".imminf2"}, f"Unsupported simple INF2 extension: {extension}")
+    outputs = []
+    for index, entry in enumerate(parse_mtninf2(data)):
+        require(entry.track_count == 0 and len(entry.body) == 68,
+                f"{extension} entry {index}: unsupported special or additional payload")
+        outputs.append(YWB1_MINF_PREFIX + entry.header[20:24] + entry.body)
+    return outputs
+
+
+def validate_character_animation2(
+    data: bytes,
+    extension: str,
+    *,
+    allow_name_alias: bool = False,
+) -> bytes:
+    """Validate an existing B1-layout animation and preserve its bytes."""
+
+    reverse = {layout.target_extension: layout for layout in CHARACTER_ANIMATION_LAYOUTS.values()}
+    require(extension in reverse, f"Unsupported existing animation extension: {extension}")
+    layout = reverse[extension]
+    require(len(data) >= layout.target_compressed_offset + 4, f"{extension} header is too short")
+    require(data[:4] == layout.magic, f"{extension} magic does not match")
+    require(not any(data[4:layout.target_work_offset]), f"{extension} reserved header is not zero-filled")
+    require(u32(data, layout.target_work_offset + 4) == layout.target_name_offset,
+            f"{extension} name offset does not match the B1 layout")
+    require(u32(data, layout.target_work_offset + 8) == layout.target_compressed_offset,
+            f"{extension} compressed offset does not match the B1 layout")
+    counts_offset = layout.target_work_offset + 12
+    descriptor_count = sum(struct.unpack_from(f"<{layout.count_fields}I", data, counts_offset))
+    hash_count = u32(data, counts_offset + 4 * layout.count_fields) if extension == ".mtn2" else descriptor_count
+    name_end = data.find(b"\0", layout.target_name_offset + 4, layout.target_compressed_offset - 4)
+    require(name_end >= layout.target_name_offset + 4, f"{extension} animation name is not NUL-terminated")
+    stored_name_id = u32(data, layout.target_name_offset)
+    require(stored_name_id != 0, f"{extension} animation-name ID is zero")
+    # Some official YW3 resources are renamed copies: y699000's IMM is
+    # byte-identical to y159000 except the debug-name bytes, while retaining
+    # y159000 IDs. Generation downgrade preserves both values. Do not
+    # recalculate an identity field and break its MINF/RES references.
+    require(allow_name_alias or crc32(data[layout.target_name_offset + 4:name_end]) == stored_name_id,
+            f"{extension} animation-name CRC32 does not match")
+    raw = level5_decompress(data[layout.target_compressed_offset:])
+    pointer_start = 12 + hash_count * 4
+    records_start = pointer_start + 2 * layout.track_count
+    descriptor_start = records_start + 8 * layout.track_count
+    data_start = descriptor_start + 16 * descriptor_count
+    require(data_start <= len(raw), f"{extension} decoded tables are out of range")
+    require(struct.unpack_from("<3I", raw) == (12, pointer_start, descriptor_start),
+            f"{extension} decoded-table offsets do not match the B1 layout")
+    require(struct.unpack_from(f"<{layout.track_count}H", raw, pointer_start) ==
+            tuple(records_start + 8 * i for i in range(layout.track_count)),
+            f"{extension} decoded track pointers are invalid")
+    for i in range(descriptor_count):
+        a, b, value, extra = struct.unpack_from("<4I", raw, descriptor_start + 16 * i)
+        require(extra == 0 and all(data_start <= x < len(raw) for x in (a, b, value)),
+                f"{extension} descriptor {i} is outside the decoded data")
+    require(u32(data, layout.target_work_offset) == len(raw) + descriptor_count * 84,
+            f"{extension} runtime work-size formula does not match")
+    return data
+
+
+def validate_character_inf(data: bytes, extension: str) -> bytes:
+    """Validate an existing B1 MINF header/special region before copying it."""
+
+    require(extension in {".mtninf", ".mtminf", ".imminf"}, f"Unsupported existing INF extension: {extension}")
+    require(len(data) >= 96 and data[:4] == b"MINF", f"{extension} common header is invalid")
+    require(data[4:12] == bytes(8) and u32(data, 12) == 28 and u32(data, 20) == 96,
+            f"{extension} offsets do not match the B1 layout")
+    name_end = data.find(b"\0", 0x20, 0x4C)
+    require(name_end > 0x20, f"{extension} logical name is empty or not NUL-terminated")
+    require(u32(data, 0x1C) == crc32(data[0x20:name_end]),
+            f"{extension} logical-name CRC32 does not match")
+    count = u32(data, 24)
+    if count == 0:
+        require(len(data) == 96 and u32(data, 16) == 0, f"{extension} has unexpected trailing data")
+    else:
+        require(extension == ".mtninf", f"{extension} special data is not supported")
+        raw = level5_decompress(data[96:])
+        require(count * 44 <= len(raw), f"{extension} special descriptor table is truncated")
+        require(u32(data, 16) == len(raw) + 128 * count,
+                f"{extension} runtime work-size formula does not match")
+        for i in range(count):
+            length, start, point, flag = struct.unpack_from("<4I", raw, 44 * i)
+            require(length >= 48 and start >= count * 44 and start + length <= len(raw),
+                    f"{extension} special descriptor {i} range is invalid")
+            dynamic = u32(raw, start + 44)
+            require(dynamic in {0, 1} and point == start + 48 + 4 * dynamic and flag == 0x10000,
+                    f"{extension} special descriptor {i} fields are invalid")
+            require(not any(raw[44 * i + 16:44 * (i + 1)]),
+                    f"{extension} special descriptor {i} reserved fields are nonzero")
+    return data
+
+
+@dataclass(frozen=True)
 class MtnInfDescriptor:
     payload_size: int
     shared_record_offset: int
@@ -1067,8 +1375,14 @@ def parse_mtninf_tail(entry: MtnInf2Entry, index: int) -> ParsedMtnInfTail:
                 f"Entry {index}, descriptor {descriptor_index}: fixed-type B/C values do not match",
             )
         elif descriptor.dynamic_count == 1:
+            # The paired x381000_p84 B1 descriptor proves the 4-byte
+            # integer payload for event 0x05E4. A=4 for other event types
+            # (notably x611000 event 0x044E) has a different auxiliary
+            # layout and remains unsupported.
+            event_type = u32(tail, descriptor_size + descriptor_index * 12 + 8)
             require(
-                descriptor.payload_size in {8, 12},
+                descriptor.payload_size in {8, 12}
+                or (descriptor.payload_size == 4 and event_type == 0x05E4),
                 f"Entry {index}, descriptor {descriptor_index}: unknown dynamic type A={descriptor.payload_size}",
             )
             require(
@@ -1154,7 +1468,7 @@ def build_ywb1_special_block(
             )
             payload = shared[descriptor.shared_payload_offset:record_end]
             require(
-                b"\0" in payload,
+                descriptor.payload_size == 4 or b"\0" in payload,
                 f"Entry {entry_index}, descriptor {descriptor_index}: shared string is not NUL-terminated",
             )
 
@@ -1287,62 +1601,170 @@ def mtninf2_names(data: bytes) -> list[bytes]:
 
     names: list[bytes] = []
     for index, entry in enumerate(parse_mtninf2(data)):
-        end = entry.body.find(b"\0", 4)
-        require(end >= 4, f"MTNINF2 entry {index} name is not NUL-terminated")
+        end = entry.body.find(b"\0", 4, 48)
+        require(end > 4, f"MTNINF2 entry {index} name is empty or not NUL-terminated")
+        require(u32(entry.body, 0) == crc32(entry.body[4:end]),
+                f"MTNINF2 entry {index} logical-name CRC32 does not match")
         names.append(entry.body[4:end])
     return names
 
 
 CHARACTER_ROOT_NAME = b"out_00"
-CHARACTER_BASE_RES_TYPES = {0x012D: 0x012C}
-CHARACTER_INF_RES_TYPES = {0x0191: 0x0190}
+CHARACTER_BASE_RES_TYPES = {0x012D: 0x012C, 0x0137: 0x0136, 0x0141: 0x0140}
+CHARACTER_INF_RES_TYPES = {0x0191: 0x0190, 0x019B: 0x019A, 0x01A5: 0x01A4}
+CHARACTER_BASE_RES_EXTENSIONS = {0x012D: ".mtn2", 0x0137: ".imm2", 0x0141: ".mtm2"}
+CHARACTER_INF_RES_EXTENSIONS = {0x0191: ".mtninf2", 0x019B: ".imminf2", 0x01A5: ".mtminf2"}
 
 
 def convert_character_res(
     data: bytes,
     mtninf2_data: bytes | None = None,
     version: int = 1,
+    *,
+    animation_files: dict[str, bytes] | None = None,
+    inf2_files: dict[str, bytes] | None = None,
 ) -> bytes:
-    """Convert one character CHRC02 RES.bin to CHRC00 or CHRC01."""
+    """Convert character RES, rebuilding every animation category's links.
+
+    The positional standalone API remains compatible. The archive pipeline
+    supplies converted animations and source INF2 bundles so multi-root MTN,
+    MTM and IMM records use their actual logical names, never a global root.
+    Already-old CHRC00/01 references are checked and preserved.
+    """
 
     require(version in {0, 1}, f"RES output version must be 0 or 1: {version}")
-    require(data[:6] == b"CHRC02", "Source RES.bin must be CHRC02")
     parsed = parse_res(data)
+    all_sections = parsed.material_sections + parsed.node_sections
+    require(not any(section.type_id == 0x0123 for section in all_sections),
+            "RES model section 0x0123 has no established B1 conversion rule")
+    for newer, older in {**CHARACTER_BASE_RES_TYPES, **CHARACTER_INF_RES_TYPES}.items():
+        matching = [section for section in all_sections if section.type_id in {newer, older}]
+        require(len(matching) <= 1, f"RES has duplicate old/new animation section 0x{older:04X}")
+        for section in matching:
+            if section.type_id == newer:
+                require(section.stride == 28 and len(section.records) == 1,
+                        f"RES section 0x{newer:04X} must contain one 28-byte bundle reference")
+            else:
+                require(section.stride == 8 and all(u32(record, 4) == 0 for record in section.records),
+                        f"RES section 0x{older:04X} has invalid legacy record size/reserved fields")
     strings = list(parsed.strings)
-    inf_names = mtninf2_names(mtninf2_data) if mtninf2_data is not None else None
+    bundles = dict(inf2_files or {})
+    if mtninf2_data is not None:
+        existing = [raw for name, raw in bundles.items() if Path(name).suffix.lower() == ".mtninf2"]
+        require(not existing or existing == [mtninf2_data], "Conflicting MTNINF2 inputs for RES conversion")
+        if not existing:
+            bundles["000.mtninf2"] = mtninf2_data
+
+    def remember(names: Sequence[bytes]) -> None:
+        for name in names:
+            if name not in strings:
+                strings.append(name)
+
+    roots: dict[str, list[bytes]] = {}
+    root_records: dict[str, tuple[bytes, ...]] = {}
+    old_inf_names: dict[str, list[bytes]] = {}
+    if animation_files is not None:
+        for layout in CHARACTER_ANIMATION_LAYOUTS.values():
+            names = _numbered_names(animation_files, layout.target_extension)
+            roots[layout.target_extension] = []
+            identifiers = []
+            for name in names:
+                raw = validate_character_animation2(animation_files[name], layout.target_extension,
+                                                    allow_name_alias=bool(bundles))
+                start = layout.target_name_offset + 4
+                end = raw.find(b"\0", start, layout.target_compressed_offset - 4)
+                require(end >= start, f"RES animation name is not NUL-terminated: {name}")
+                roots[layout.target_extension].append(raw[start:end])
+                identifiers.append(struct.pack("<II", u32(raw, layout.target_name_offset), 0))
+            root_records[layout.target_extension] = tuple(identifiers)
+        for extension in (".mtninf", ".mtminf", ".imminf"):
+            old_inf_names[extension] = []
+            for name in _numbered_names(animation_files, extension):
+                raw = validate_character_inf(animation_files[name], extension)
+                end = raw.find(b"\0", 0x20, 0x4C)
+                require(end > 0x20, f"RES logical INF name is empty or unterminated: {name}")
+                old_inf_names[extension].append(raw[0x20:end])
+
+    def logical_inf_names(extension: str) -> list[bytes]:
+        candidates = [raw for name, raw in sorted(bundles.items()) if Path(name).suffix.lower() == extension]
+        require(len(candidates) == 1, f"RES {extension} conversion requires exactly one bundle from the same archive")
+        return mtninf2_names(candidates[0])
+
+    def references(names: Sequence[bytes]) -> tuple[bytes, ...]:
+        return tuple(struct.pack("<II", crc32(name), 0) for name in names)
 
     def convert_sections(sections: Sequence[ResSection]) -> list[ResSection]:
         converted: list[ResSection] = []
         for section in sections:
             if section.type_id in CHARACTER_BASE_RES_TYPES:
+                extension = CHARACTER_BASE_RES_EXTENSIONS[section.type_id]
+                if animation_files is None:
+                    require(section.type_id == 0x012D and len(section.records) == 1,
+                            "RES multiple/category-specific animation roots require converted animation files")
+                    root_names = [CHARACTER_ROOT_NAME]
+                else:
+                    root_names = roots[extension]
+                    # The newer RES record names the physical bundle. Its
+                    # one record expands to every logical animation root.
+                    require(section.stride == 28 and len(section.records) == 1 and root_names,
+                            f"RES {extension} requires one physical bundle reference and nonempty converted animations")
+                remember(root_names)
                 converted.append(
                     ResSection(
                         CHARACTER_BASE_RES_TYPES[section.type_id],
                         8,
-                        (struct.pack("<II", crc32(CHARACTER_ROOT_NAME), 0),),
+                        references(root_names) if animation_files is None else root_records[extension],
                     )
                 )
             elif section.type_id in CHARACTER_INF_RES_TYPES:
-                require(
-                    inf_names is not None,
-                    "RES section 0x0191 conversion requires the .mtninf2 from the same p80/p84 archive",
-                )
-                for name in inf_names:
-                    if name not in strings:
-                        strings.append(name)
+                require(section.stride == 28 and len(section.records) == 1,
+                        f"RES section 0x{section.type_id:04X} must contain one 28-byte bundle reference")
+                inf_names = logical_inf_names(CHARACTER_INF_RES_EXTENSIONS[section.type_id])
+                remember(inf_names)
                 converted.append(
                     ResSection(
                         CHARACTER_INF_RES_TYPES[section.type_id],
                         8,
-                        tuple(struct.pack("<II", crc32(name), 0) for name in inf_names),
+                        references(inf_names),
                     )
                 )
             else:
+                if animation_files is not None:
+                    for newer, older in CHARACTER_BASE_RES_TYPES.items():
+                        if section.type_id == older:
+                            expected = root_records[CHARACTER_BASE_RES_EXTENSIONS[newer]]
+                            require(section.stride == 8 and section.records == expected,
+                                    f"Existing RES animation references 0x{older:04X} do not match animation files")
+                    for newer, older in CHARACTER_INF_RES_TYPES.items():
+                        if section.type_id == older:
+                            extension = CHARACTER_INF_RES_EXTENSIONS[newer][:-1]
+                            expected = references(old_inf_names[extension])
+                            require(section.stride == 8 and section.records == expected,
+                                    f"Existing RES INF references 0x{older:04X} do not match INF files")
                 converted.append(section)
         return converted
 
     materials = convert_sections(parsed.material_sections)
     nodes = convert_sections(parsed.node_sections)
+    if animation_files is not None:
+        sections = materials + nodes
+        for newer, older in CHARACTER_BASE_RES_TYPES.items():
+            expected = root_records[CHARACTER_BASE_RES_EXTENSIONS[newer]]
+            matches = [section for section in sections if section.type_id == older]
+            require(len(matches) == (1 if expected else 0),
+                    f"RES animation section 0x{older:04X} presence/count does not match converted files")
+            if matches:
+                require(matches[0].stride == 8 and matches[0].records == expected,
+                        f"RES animation section 0x{older:04X} references do not match converted files")
+        for newer, older in CHARACTER_INF_RES_TYPES.items():
+            extension = CHARACTER_INF_RES_EXTENSIONS[newer][:-1]
+            expected = references(old_inf_names[extension])
+            matches = [section for section in sections if section.type_id == older]
+            require(len(matches) == (1 if expected else 0),
+                    f"RES INF section 0x{older:04X} presence/count does not match converted files")
+            if matches:
+                require(matches[0].stride == 8 and matches[0].records == expected,
+                        f"RES INF section 0x{older:04X} references do not match converted files")
     material_table_offset = 20
     node_table_offset = material_table_offset + len(materials) * 8
     data_offset = node_table_offset + len(nodes) * 8
@@ -1469,20 +1891,16 @@ def convert_p00_internal_files(
         )
 
     by_suffix = {suffix: _numbered_names(files, suffix) for suffix in supported}
-    for suffix in (".atr", ".cmn", ".mbn", ".mtr", ".prm"):
+    # B1 includes bone/parameter-only model archives and models with zero or
+    # multiple textures, projections and LKAT files. Validate resource-table
+    # counts instead of imposing the original ten-sample cardinalities.
+    # Bone-less model support has not been established in the B1 corpus.
+    for suffix in (".cmn", ".mbn"):
         require(by_suffix[suffix], f"p00 does not contain a {suffix} file")
-    for suffix in (".lkat", ".sil", ".xi"):
-        require(
-            len(by_suffix[suffix]) == 1,
-            f"p00 requires exactly one {suffix} file (found: {len(by_suffix[suffix])})",
-        )
-    require(
-        len(by_suffix[".txp"]) <= 1,
-        f"p00 must contain zero or one .txp file (found: {len(by_suffix['.txp'])})",
-    )
 
     parsed_res = parse_res(files[res_names[0]])
-    require(files[res_names[0]][:6] == b"CHRC02", "Source p00 RES.bin must be CHRC02")
+    require(not any(s.type_id == 0x0123 for s in parsed_res.material_sections),
+            "RES model section 0x0123 has no established B1 conversion rule")
     string_crcs = {crc32(raw) for raw in parsed_res.strings}
 
     material_links = {
@@ -1500,7 +1918,8 @@ def convert_p00_internal_files(
     }
     # Keep the local names so static analysis and future extensions make it
     # explicit that the material-side sections were also validated above.
-    require(all(section is not None for section in material_links.values()), "RES material references are incomplete")
+    # A missing material kind is valid if both its files and RES section are
+    # absent; _res_section already verified that correspondence.
 
     outputs: dict[str, bytes] = {}
     converters = {
@@ -1565,14 +1984,10 @@ def convert_p00_internal_files(
             (total_size, extra_size) == (expected_total, expected_extra),
             f"RES and {name} CMN variable-length metadata do not match",
         )
-        if u16(data, 0x08) == CMN_ARRAY_TYPE:
-            for index in range(u16(data, 0x0A)):
-                offset = 12 + index * 8
-                if u32(data, offset + 4) == 2:
-                    require(
-                        u32(data, offset) in string_crcs,
-                        f"The reference for {name} CMN array element {index} is missing from the RES string table",
-                    )
+        # Type-2 array values may reference objects outside this RES string
+        # table. Native B1 MESH_DRAW_ALP0/SHADOW records prove this is valid.
+        # convert_character_cmn still checks every element's type and value;
+        # external resolution is a game-context check, not a local CRC check.
 
     outputs["RES.bin"] = convert_character_res(files[res_names[0]], None, res_version)
     require(set(outputs) == (set(files) - set(res_names)) | {"RES.bin"}, "p00 output file set does not match the input")
@@ -1615,17 +2030,14 @@ def convert_p8_internal_files(
         )
 
     names = sorted(files, key=lambda name: name.encode("utf-8"))
-    mtn3_names = [name for name in names if Path(name).suffix.lower() == ".mtn3"]
-    mtninf2_names_found = [name for name in names if Path(name).suffix.lower() == ".mtninf2"]
     res_names = [name for name in names if name.lower() == "res.bin"]
-    require(len(mtn3_names) == 1, f"Exactly one .mtn3 file is required (found: {len(mtn3_names)})")
-    require(
-        len(mtninf2_names_found) == 1,
-        f"Exactly one .mtninf2 file is required (found: {len(mtninf2_names_found)})",
-    )
     require(len(res_names) == 1, f"Exactly one RES.bin is required (found: {len(res_names)})")
 
-    supported = {".mtn3", ".mtninf2", ".cmn"}
+    supported = {
+        ".mtn3", ".mtm3", ".imm3", ".mtninf2", ".mtminf2", ".imminf2",
+        ".mtn2", ".mtm2", ".imm2", ".mtninf", ".mtminf", ".imminf",
+        ".cmn", ".lkat", ".sil",
+    }
     for name in names:
         if name in res_names:
             continue
@@ -1640,22 +2052,58 @@ def convert_p8_internal_files(
         require(name not in outputs, f"Output filename collision: {name} (source: {source_name})")
         outputs[name] = payload
 
-    mtn3_name = mtn3_names[0]
-    put(Path(mtn3_name).with_suffix(".mtn2").name, convert_mtn3(files[mtn3_name]), mtn3_name)
+    inf2_files: dict[str, bytes] = {}
+    for extension, layout in CHARACTER_ANIMATION_LAYOUTS.items():
+        bundled = _numbered_names(files, extension)
+        existing = _numbered_names(files, layout.target_extension)
+        require(len(bundled) <= 1, f"At most one {extension} bundle is supported (found: {len(bundled)})")
+        require(not (bundled and existing), f"p80/p84 mixes {extension} and {layout.target_extension}")
+        if extension == ".mtn3":
+            require(bundled or existing, "p80/p84 does not contain .mtn3 or .mtn2 animation data")
+        for name in bundled:
+            try:
+                converted = convert_character_animation3(files[name], extension)
+            except ConversionError as error:
+                raise ConversionError(f"Failed to convert {name}: {error}") from error
+            for index, payload in enumerate(converted):
+                validate_character_animation2(payload, layout.target_extension, allow_name_alias=True)
+                put(f"{index:03d}{layout.target_extension}", payload, name)
+        for name in existing:
+            put(name, validate_character_animation2(files[name], layout.target_extension), name)
 
-    mtninf2_name = mtninf2_names_found[0]
-    mtninf2_data = files[mtninf2_name]
-    for index, payload in enumerate(convert_mtninf2(mtninf2_data)):
-        put(f"{index:03d}.mtninf", payload, mtninf2_name)
+    for extension in (".mtninf2", ".mtminf2", ".imminf2"):
+        target_extension = extension[:-1]
+        bundled = _numbered_names(files, extension)
+        existing = _numbered_names(files, target_extension)
+        require(len(bundled) <= 1, f"At most one {extension} bundle is supported (found: {len(bundled)})")
+        require(not (bundled and existing), f"p80/p84 mixes {extension} and {target_extension}")
+        if extension == ".mtninf2":
+            require(bundled or existing, "p80/p84 does not contain .mtninf2 or .mtninf data")
+        for name in bundled:
+            inf2_files[name] = files[name]
+            try:
+                converted = (convert_mtninf2(files[name]) if extension == ".mtninf2"
+                             else convert_simple_inf2(files[name], extension))
+            except ConversionError as error:
+                raise ConversionError(f"Failed to convert {name}: {error}") from error
+            for index, payload in enumerate(converted):
+                validate_character_inf(payload, target_extension)
+                put(f"{index:03d}{target_extension}", payload, name)
+        for name in existing:
+            put(name, validate_character_inf(files[name], target_extension), name)
 
+    extra_converters = {".cmn": convert_character_cmn, ".lkat": convert_character_lkat,
+                        ".sil": convert_character_sil}
     for name in names:
-        if Path(name).suffix.lower() == ".cmn":
-            put(name, convert_character_cmn(files[name]), name)
+        suffix = Path(name).suffix.lower()
+        if suffix in extra_converters:
+            put(name, extra_converters[suffix](files[name]), name)
 
     res_name = res_names[0]
     put(
         "RES.bin",
-        convert_character_res(files[res_name], mtninf2_data, res_version),
+        convert_character_res(files[res_name], None, res_version,
+                              animation_files=outputs, inf2_files=inf2_files),
         res_name,
     )
 
@@ -2009,11 +2457,23 @@ def _character_archive_base(filename: str) -> str:
 def convert_character_xc_archives(
     archives: dict[str, bytes],
     res_version: int = 1,
+    *,
+    copy_p00: bool = False,
 ) -> dict[str, bytes]:
-    """Convert one same-character p00/p80/p84 archive trio in memory."""
+    """Convert same-character XC files; optionally preserve p00 verbatim.
+
+    Normal mode requires a complete trio and converts every archive. Explicit
+    copy mode accepts the available slots only, validates the p00 container,
+    and preserves its complete original bytes without internal conversion or
+    repacking. Motion conversion errors are never suppressed.
+    """
 
     require(res_version in {0, 1}, f"RES output version must be 0 or 1: {res_version}")
-    require(len(archives) == 3, f"Exactly three XC archives (p00/p80/p84) are required (found: {len(archives)})")
+    if copy_p00:
+        require(1 <= len(archives) <= 3,
+                f"One to three XC archives (p00/p80/p84) are required in p00 copy mode (found: {len(archives)})")
+    else:
+        require(len(archives) == 3, f"Exactly three XC archives (p00/p80/p84) are required (found: {len(archives)})")
     by_slot: dict[str, tuple[str, bytes]] = {}
     bases: set[str] = set()
     for name, archive in archives.items():
@@ -2027,21 +2487,29 @@ def convert_character_xc_archives(
         bases.add(_character_archive_base(name).casefold())
 
     missing = [slot for slot in CHARACTER_ARCHIVE_SLOTS if slot not in by_slot]
-    require(not missing, "Missing character XC archives: " + ", ".join(missing))
+    require(copy_p00 or not missing, "Missing character XC archives: " + ", ".join(missing))
     require(len(bases) == 1, "Character base names do not match across p00/p80/p84")
 
     outputs: dict[str, bytes] = {}
     for slot in CHARACTER_ARCHIVE_SLOTS:
+        if slot not in by_slot:
+            continue
         name, archive = by_slot[slot]
         if slot == "p00":
-            outputs[name] = convert_p00_xc_archive(archive, res_version)
+            if copy_p00:
+                # Validate the XPCK framing, filename CRCs and RES compression
+                # only. Its internal resources need not pass p00 conversion.
+                unpack_xpck_archive(archive)
+                outputs[name] = archive
+            else:
+                outputs[name] = convert_p00_xc_archive(archive, res_version)
         else:
             outputs[name] = convert_p8_xc_archive(archive, res_version)
     return outputs
 
 
-def find_character_xc_files(input_path: Path) -> dict[str, Path]:
-    """Resolve one character's three XC paths from a directory or one member."""
+def find_character_xc_files(input_path: Path, *, allow_partial: bool = False) -> dict[str, Path]:
+    """Resolve one character's XC paths, optionally permitting missing slots."""
 
     if input_path.is_file():
         require(input_path.suffix.lower() == ".xc", "Input file extension must be .xc")
@@ -2055,7 +2523,15 @@ def find_character_xc_files(input_path: Path) -> dict[str, Path]:
             (path for path in search_dir.iterdir() if path.is_file() and path.suffix.lower() == ".xc"),
             key=lambda path: path.name.encode("utf-8"),
         )
-        require(candidates, f"Input directory contains no XC archives: {search_dir}")
+        selected = []
+        for path in candidates:
+            try:
+                character_archive_slot(path.name)
+            except ConversionError:
+                continue
+            selected.append(path)
+        candidates = selected
+        require(candidates, f"Input directory contains no p00/p80/p84 XC archives: {search_dir}")
         bases: dict[str, str] = {}
         for path in candidates:
             base = _character_archive_base(path.name)
@@ -2074,8 +2550,6 @@ def find_character_xc_files(input_path: Path) -> dict[str, Path]:
         try:
             slot = character_archive_slot(path.name)
         except ConversionError:
-            if input_path.is_dir():
-                raise ConversionError(f"XC archive has a nonstandard name: {path.name}")
             continue
         if _character_archive_base(path.name).casefold() != selected_base:
             continue
@@ -2084,10 +2558,10 @@ def find_character_xc_files(input_path: Path) -> dict[str, Path]:
 
     missing = [slot for slot in CHARACTER_ARCHIVE_SLOTS if slot not in resolved]
     require(
-        not missing,
+        allow_partial or not missing,
         "XC archives for the same character are missing: " + ", ".join(missing),
     )
-    return {slot: resolved[slot] for slot in CHARACTER_ARCHIVE_SLOTS}
+    return {slot: resolved[slot] for slot in CHARACTER_ARCHIVE_SLOTS if slot in resolved}
 
 
 def convert_character_xc_set(
@@ -2095,10 +2569,12 @@ def convert_character_xc_set(
     output_dir: Path,
     res_version: int = 1,
     overwrite: bool = False,
+    *,
+    copy_p00: bool = False,
 ) -> list[Path]:
-    """Discover, convert, and write one p00/p80/p84 archive trio."""
+    """Discover and atomically prepare one character's XC output set."""
 
-    source_paths = find_character_xc_files(input_path)
+    source_paths = find_character_xc_files(input_path, allow_partial=copy_p00)
     resolved_output_dir = output_dir.resolve()
     if resolved_output_dir.exists():
         require(
@@ -2112,7 +2588,7 @@ def convert_character_xc_set(
         )
 
     archives = {path.name: path.read_bytes() for path in source_paths.values()}
-    converted = convert_character_xc_archives(archives, res_version)
+    converted = convert_character_xc_archives(archives, res_version, copy_p00=copy_p00)
     return write_named_outputs(converted, resolved_output_dir, overwrite)
 
 
@@ -2136,7 +2612,11 @@ def pack_xpck_file(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Convert YW3 character resources to YWB1 format")
+    parser = argparse.ArgumentParser(
+        description="Convert YW3 character resources to YWB1 format",
+        epilog="Automatic shorthand: character_converter.py INPUT OUTPUT_DIRECTORY --auto [--copy-p00]. "
+               "Without --copy-p00, all three XC files are required and converted.",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
     mtninf2 = subparsers.add_parser("mtninf2", help="Convert mtninf2 into individual mtninf files")
     mtninf2.add_argument("input", type=Path, help="YW3 .mtninf2 file")
@@ -2252,22 +2732,46 @@ def build_parser() -> argparse.ArgumentParser:
     character_xc.add_argument(
         "input",
         type=Path,
-        help="Directory containing all three XC archives, or any one of those archives",
+        help="Directory containing one character's p00/p80/p84 archives, or any one of them. "
+             "All three are required unless --copy-p00 is specified; other XC slots are ignored.",
     )
-    character_xc.add_argument("output_dir", type=Path, help="Directory for the three converted XC archives with the same filenames")
+    character_xc.add_argument("output_dir", type=Path, help="Directory for the output XC archives with the same filenames")
     character_xc.add_argument(
         "--res-version",
         type=int,
         choices=(0, 1),
         default=1,
-        help="Output CHRC version for every RES.bin (default: 1)",
+        help="CHRC version for converted RES.bin files (default: 1); copied p00 is never modified",
     )
-    character_xc.add_argument("--overwrite", action="store_true", help="Overwrite the three existing XC archives with the same names")
+    character_xc.add_argument("--overwrite", action="store_true", help="Overwrite existing output XC archives with the same names")
+    character_xc.add_argument(
+        "--copy-p00",
+        action="store_true",
+        help="Copy p00 XC unchanged after container validation; convert available p80/p84 normally. "
+             "Missing slots are allowed. No motion-error fallback.",
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    option_end = arguments.index("--") if "--" in arguments else len(arguments)
+    auto_count = arguments[:option_end].count("--auto")
+    if auto_count:
+        if auto_count != 1:
+            parser.error("--auto must be specified only once")
+        arguments.remove("--auto")
+        # Keep existing subcommands intact. The flag is an alias for just the
+        # character-XC workflow, not for single-file/internal-file commands.
+        subcommands = {"mtninf2", "mtn3", "prm", "lkat", "sil", "res", "p00-content",
+                       "p8-content", "pack-xc", "p00-xc", "p8-xc", "character-xc"}
+        if arguments and arguments[0] in subcommands:
+            if arguments[0] != "character-xc":
+                parser.error("--auto is only valid for character-xc conversion")
+        else:
+            arguments.insert(0, "character-xc")
+    args = parser.parse_args(arguments)
     try:
         if args.command == "mtninf2":
             paths = convert_mtninf2_file(args.input, args.output_dir, args.overwrite)
@@ -2372,7 +2876,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.output_dir,
                 args.res_version,
                 args.overwrite,
+                copy_p00=args.copy_p00,
             )
+            if args.copy_p00:
+                p00_present = any(character_archive_slot(path.name) == "p00" for path in paths)
+                print(
+                    "Automatic conversion complete (p00 copy mode): "
+                    f"{', '.join(path.name for path in paths)} -> {args.output_dir.resolve()} "
+                    f"(p00 {'copied unchanged' if p00_present else 'not present'}; "
+                    f"available p80/p84 converted with CHRC0{args.res_version})"
+                )
+                return 0
             print(
                 "Three-file automatic conversion complete: "
                 f"{', '.join(path.name for path in paths)} -> {args.output_dir.resolve()} "

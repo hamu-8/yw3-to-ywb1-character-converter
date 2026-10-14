@@ -15,20 +15,28 @@ This specification records how those findings are implemented. End-user commands
 The implementation is contained in:
 
 ```text
-character_convert/character_converter.py
+character_converter.py
 ```
+
+That script is at the root of the cloned or extracted public repository and uses only Python's standard library. The public release contains seven files: the script, `README.md`, `USER_GUIDE.md`, `FORMAT_ANALYSIS.md`, this specification, `LICENSE.md`, and `.gitignore`. No ROM/XC samples, extracted-content directories, tests, development tools, or audit JSON files are distributed. Test/tool names and corpus counts in this specification document the private development evidence; they are not missing release dependencies or commands you can run against bundled fixtures. Prepare your own inputs as described in the user guide.
 
 ## 2. Scope
 
+Full-corpus recovery on 2026-10-14 supersedes the initial ten-sample-only limits. That strict-conversion audit structurally converted 2,843 of 2,949 supplied p00/p80/p84 XC files, leaving 106 unresolved: 104 p00 internal-conversion cases and two special motion cases. This remains historical evidence for the strict path, not a claim that 104 unchanged models are impossible to transplant. New archive-level regression tests are `test_character_archive_recovery.py`, `test_character_model_recovery.py`, `test_character_motion_recovery.py`, and `test_character_xi_recovery.py` (39 tests at that audit). Corpus-dependent cases use private ROM inputs and skip when absent; historical tests referring to the removed original extracted fixtures are not represented as newly passing tests.
+
+The corpus-wide audit processes every existing target XC independently, including characters missing one or more of the three slots. Default `character-xc` still requires a complete trio and strict conversion of every member. The explicit `--copy-p00` mode added on 2026-10-15 permits partial major-slot sets and copies a present p00 unchanged; [Appendix C](#appendix-c-explicit-p00-copy-and-auto-cli) defines its reduced validation guarantee. No conversion of other XC slots or XV/XR is implied. No new variant is claimed game-tested.
+
 ### 2.1 Supported XC Slots
 
-The converter handles three archives per character.
+The converter handles three principal archive slots per character. A complete trio is required by default; explicit p00-copy mode can process an available subset.
 
 | Slot | Contents | Main operation |
 |---|---|---|
 | `p00` | Model-related resources | Convert PRM, LKAT, and RES; validate and preserve the remaining model formats |
-| `p80` | Motion-related resources | Convert MTN3, MTNINF2, and RES; validate and preserve CMN |
-| `p84` | Motion-related resources | Convert MTN3, MTNINF2, and RES; validate and preserve CMN |
+| `p80` | Motion-related resources | Convert supported MTN/MTM/IMM and INF families, rebuild RES, and process optional CMN/LKAT/SIL |
+| `p84` | Motion-related resources | Convert supported MTN/MTM/IMM and INF families, rebuild RES, and process optional CMN/LKAT/SIL |
+
+This table describes strict conversion. Explicit `--copy-p00` replaces the p00 operation with XPCK container validation and original-byte preservation; the present p80/p84 operations remain unchanged.
 
 XC names are expected to combine a character base name and slot.
 
@@ -48,6 +56,8 @@ y473000_p84.xc
 
 ### 2.2 Supported Internal Formats
 
+The motion/RES rows below describe the initial ten-pair implementation. [Appendix M](#appendix-m-full-corpus-motion-update) supersedes the initial-only restrictions with the current full-corpus motion and RES behavior.
+
 | YW3 input | Output or handling |
 |---|---|
 | `mtn3` | Convert to `mtn2` |
@@ -59,7 +69,7 @@ y473000_p84.xc
 | `mtr` | Preserve after MTR/LUTC validation |
 | `mbn` | Preserve after structural validation |
 | `sil` | Preserve after XCSL/CMBC validation |
-| `xi` | Preserve after IMGC00/ETC1 validation |
+| `xi` | Preserve after IMGC00 and verified-image-format validation |
 | `txp` | Preserve after structural validation |
 | `cmn` | Preserve after type and variable-length validation |
 
@@ -90,6 +100,8 @@ The implementation satisfies these requirements.
 9. Re-extract each newly packed XPCK and verify exact equality with the converted internal-file set.
 10. Keep the character and effect converter implementations separate while reusing the established binary knowledge.
 
+The internal-format transformation/validation and repack requirements describe strict conversion. Explicit p00 preservation in Appendix C replaces them for that one slot with container validation and whole-archive byte identity; motion conversion remains strict.
+
 ## 4. Runtime and Dependencies
 
 ### 4.1 Python Version
@@ -114,9 +126,11 @@ No external Python package is required. Only the standard library is used.
 | `os` | Temporary file handling and replacement |
 | `shutil` | Staging-directory cleanup |
 | `struct` | Little-endian integer and float access |
+| `sys` | Read command-line arguments for `--auto` normalization |
 | `tempfile` | Temporary files and directories |
 | `dataclasses` | Parsed binary structures |
 | `pathlib` | Path handling |
+| `typing` | Type annotations such as `Sequence` |
 
 ### 4.3 Endianness
 
@@ -177,7 +191,7 @@ The top-level CLI catches `ConversionError` and `OSError` and prints a concise m
 
 ### 6.3 Unknown Structures
 
-The converter does not zero unknown fields, round them to a nearby known value, or silently drop unsupported files. It stops as soon as input falls outside the analyzed structures.
+The strict conversion paths do not zero unknown fields, round them to a nearby known value, or silently drop unsupported files. They stop as soon as input falls outside the analyzed structures. Explicit p00-copy mode is not a guessed transformation: it checks the container and retains the entire source archive without validating or converting its model internals. Motion paths remain strict in either mode.
 
 This is intended to prevent a misleading “successful conversion” whose only observable result in game is a missing model or animation.
 
@@ -196,6 +210,8 @@ CRC32 is used to verify filenames, RES strings, node names, and other references
 ## 8. Level-5 Compression
 
 ### 8.1 Decompression
+
+The initial table below predates kind-0 source blocks. The current decoder accepts kinds 0–4; see [Appendix M](#appendix-m-full-corpus-motion-update).
 
 `level5_decompress` interprets the first u32 as:
 
@@ -314,6 +330,8 @@ This function accepts a flat `dict[str, bytes]` and returns deterministic XPCK `
 
 ### 11.1 Conversion Function
 
+This single-output API remains compatible. The archive pipeline uses the multi-entry family API in [Appendix M](#appendix-m-full-corpus-motion-update) for bundled MTN/MTM/IMM.
+
 ```python
 convert_mtn3(data: bytes) -> bytes
 ```
@@ -370,6 +388,8 @@ One MTNINF2 container produces a list of individual YWB1 MTNINF files in source-
 5. Split any remaining body tail into special descriptors, fixed values, dynamic prefix values, and a shared compressed region.
 
 ### 12.3 Supported Special Descriptors
+
+The table below is the initial supported set. A=4/event `0x05E4` is now supported only under its separately verified rule; A=4/event `0x044E` and A=16 remain unsupported. See [Appendix M](#appendix-m-full-corpus-motion-update).
 
 The 16-byte descriptor is interpreted as four u32 values.
 
@@ -432,6 +452,8 @@ convert_character_prm(data: bytes) -> bytes
 - The block selected by `u32@0x0C` and `u32@0x10` has length `0x4C`.
 - The final 16 bytes of that block are zero.
 
+Already-old PRMs with a `0x44` block are also accepted as byte-identical copies after validating the known eight-byte marker and name/material-name ranges. An unknown nonzero tail in a `0x4C` source block is not treated as safely removable padding.
+
 ### 13.3 Transformation
 
 Replace the final 16 bytes of the generation-specific block with:
@@ -460,6 +482,8 @@ convert_character_lkat(data: bytes) -> bytes
 - Set `u16@0x26` to `0x3F00`.
 - Preserve every other byte.
 
+This is the retained normalization policy confirmed for the initial pairs and prior game-tested samples, not a proven semantic version field. The B1-only `y275010` packed-header exception is unparsed; no supplied YW3 LKAT has that form. See the LKAT caveat in the format-analysis document.
+
 ## 15. Validated Byte-Identical Formats
 
 Shared formats are passed through a validator rather than copied blindly. Each function returns the original `bytes` after successful validation.
@@ -481,8 +505,9 @@ Shared formats are passed through a validator rather than copied blindly. Each f
 
 - `ATRC01\0\0` magic.
 - Header length `0x0C`.
-- Layout `0x01E3` has total length 40.
-- Layout `0x01E4` has total length 36.
+- The block at `0x0C` is Level-5 compressed data, not a layout identifier.
+- `0x01E3` and `0x01E4` encode 60 decoded bytes with compression kind 3 or 4.
+- The decoded payload is exactly 60 bytes and starts with the value 60. Compressed length is variable.
 
 ### 15.3 MTR/LUTC
 
@@ -492,7 +517,7 @@ Shared formats are passed through a validator rather than copied blindly. Each f
 - Header length `0x18`.
 - Reserved fields are zero.
 - Total length is four-byte aligned.
-- Up to three LUTC offsets are contiguous from the first slot, ascending, and unique.
+- Up to three independent LUTC slots may be zero. Nonzero offsets remain ascending, unique, aligned, and in range; a zero slot between populated slots is valid.
 - Metadata is LZ10 and expands to `0xE8` bytes.
 - LUTC magic is `LUTC00\0\0`.
 - LUTC fixed header values are supported.
@@ -505,7 +530,7 @@ Shared formats are passed through a validator rather than copied blindly. Each f
 
 - Total length `0xA8`.
 - Nonzero node-ID CRC32.
-- Confirmed flag value 4 or 12.
+- Confirmed flag value 4, 5, or 12.
 - All 39 floats are finite.
 
 Parent hierarchy and RES references are validated during complete p00 conversion.
@@ -516,13 +541,15 @@ Parent hierarchy and RES references are validated during complete p00 conversion
 
 - `IMGC00\0\0` magic.
 - Confirmed header values.
-- Image format `0x1B`, ETC1.
+- Image formats `0x1B` (32 bytes per stored 8-by-8 tile) and `0x1C` (64 bytes per tile), with their observed associated header fields.
 - Positive width and height, each divisible by eight.
 - Tile-table and image-region sizes, placement, and zero padding.
-- Huffman4 tile table.
+- Tile-table aligned size at `0x38` equals `align4(u32@0x34)`, not necessarily the unaligned size.
+- Supported Level-5 compression kinds 0 through 4 for both tile and image data.
 - Expanded tile-table length `width * height / 32`.
-- LZ10 image data.
-- Nonempty expanded image data in 32-byte units and no larger than the ETC1 maximum.
+- Nonempty expanded image data in the format's tile-byte units, bounded by the image dimensions.
+- The decoded u16 tile indices cover exactly `0..stored_tile_count-1`; malformed or missing references are rejected.
+- Format `0x04` has no B1 example in the supplied corpus and remains unsupported.
 
 ### 15.6 TXP
 
@@ -583,7 +610,9 @@ ResSection
 
 ### 16.3 `convert_character_res`
 
-Only `CHRC02` is accepted as conversion input. Output version is 0 or 1.
+The single-root MTN rule below is the legacy positional-API behavior. Full archive conversion now supplies category-aware context and actual animation identities as specified in [Appendix M](#appendix-m-full-corpus-motion-update).
+
+In the initial implementation, only `CHRC02` was accepted as conversion input. The current implementation also checks and reserializes known `CHRC00/01` inputs, as specified in Appendix M. Output version remains 0 or 1.
 
 | YW3 type | YWB1 type | Generated content |
 |---:|---:|---|
@@ -619,10 +648,11 @@ convert_p00_internal_files(
 - Exactly one `RES.bin`.
 - No unsupported extension.
 - Every extension uses an unbroken `000.ext`, `001.ext`, and so on sequence.
-- At least one ATR, CMN, MBN, MTR, and PRM.
-- Exactly one LKAT, SIL, and XI.
-- Zero or one TXP.
-- Source RES is `CHRC02`.
+- At least one CMN and MBN. Bone-less p00 models remain unsupported because no B1 example establishes their loading rule.
+- Other known model kinds may be absent or repeated; their file counts must exactly match the corresponding RES sections.
+- Multiple XI, TXP, and LKAT files are supported. Missing material resources are valid for bone/parameter-only models when their RES sections are also absent.
+- Source RES may be `CHRC02`, or an already-old `CHRC00/01` resource with validated references.
+- Unknown model RES type `0x0123` and `prmgrp` remain rejected.
 
 ### 17.3 RES Count Cross-Checks
 
@@ -661,7 +691,8 @@ If an optional format has zero files, its section must be absent. Otherwise ther
 - RES record CRC matches the parameter-name CRC.
 - Parameter-name CRC exists in the RES string table.
 - For variable-length CMN, RES total and extra sizes match the file length.
-- Every element-type-2 CRC reference exists in the RES string table.
+- Element-type-2 CRC references may resolve outside the local RES string table; native B1 MESH_DRAW_ALP0 and SHADOW records establish this. Their type and nonzero value are validated, but external game-context resolution is not claimed.
+- Array element type 1 is still unsupported. The unique `COLLISION_RECT` scalar with RES size metadata `(12,0)` also remains rejected rather than being silently normalized to `(0,0)`.
 
 ### 17.5 Processing Order
 
@@ -684,6 +715,8 @@ convert_p8_internal_files(
 ```
 
 ### 18.2 Input Conditions
+
+These are the initial-corpus conditions, not current universal limits. Bundles, optional IMM/MTM, old resources, and optional LKAT/SIL follow [Appendix M](#appendix-m-full-corpus-motion-update).
 
 - Exactly one `.mtn3`.
 - Exactly one `.mtninf2`.
@@ -778,23 +811,23 @@ Raw-XC conversion runs in memory and does not create a user-visible `_content` d
 - A directory containing one character's three XC archives.
 - Any one member of the three-file set.
 
-For directory input, every XC must belong to one case-insensitive base name. For file input, only sibling XC archives with the selected file's base name are considered.
+For directory input, every selected major XC must belong to one case-insensitive base name. Non-major XC slots are ignored in both normal and copy modes. For file input, the file must identify p00/p80/p84; only major sibling XC archives with its base name are considered. Discovery is not recursive.
 
 ### 21.2 Consistency Checks
 
-- Exactly one p00, p80, and p84.
+- Exactly one p00, p80, and p84 in default strict mode; one to three available major slots in explicit copy mode.
 - No duplicate slot.
-- One case-insensitive base name shared by all three.
-- A nonstandard XC name is not silently ignored during directory discovery.
+- One case-insensitive base name shared by all selected files.
+- Directory discovery ignores XC filenames that do not identify a major slot; those files are neither converted nor copied.
 
 ### 21.3 Conversion
 
 ```python
-convert_character_xc_archives(archives, res_version) -> dict[str, bytes]
-convert_character_xc_set(input_path, output_dir, res_version, overwrite) -> list[Path]
+convert_character_xc_archives(archives, res_version=1, *, copy_p00=False) -> dict[str, bytes]
+convert_character_xc_set(input_path, output_dir, res_version=1, overwrite=False, *, copy_p00=False) -> list[Path]
 ```
 
-p00 is dispatched to the p00 pipeline; p80 and p84 use the p8 pipeline. All three conversions and XPCK self-checks complete before files are staged for output. Input filenames are preserved.
+By default, p00 is dispatched to the p00 pipeline and p80/p84 use the p8 pipeline. With `copy_p00=True`, a present p00 is container-validated and its original XC bytes are returned without internal conversion or repacking; present motion slots still use the normal p8 pipeline. All selected files are prepared and checked before output staging begins. Missing slots are permitted only in copy mode and are never synthesized. Input filenames are preserved.
 
 ## 22. File Writing and Overwrite Policy
 
@@ -831,11 +864,19 @@ General syntax:
 python character_converter.py <command> [arguments] [options]
 ```
 
+Equivalent automatic shorthand:
+
+```text
+python character_converter.py INPUT OUTPUT_DIRECTORY --auto [--copy-p00]
+```
+
+`--auto` selects `character-xc`; it is not recursive corpus conversion. See [Appendix C](#appendix-c-explicit-p00-copy-and-auto-cli).
+
 ### 23.1 Commands
 
 | Command | Input | Output | Purpose |
 |---|---|---|---|
-| `character-xc` | Directory containing three XC files, or any one member | Directory | Recommended complete p00/p80/p84 conversion |
+| `character-xc` | One-character major-XC directory, or any one major member | Directory | Strict complete-trio conversion by default; explicit copy mode permits a partial set |
 | `p00-xc` | Raw p00 XC | Directory | Convert p00 only |
 | `p8-xc` | Raw p80 or p84 XC | Directory | Convert one p80/p84 archive |
 | `p00-content` | Extracted p00 directory | Directory | Convert complete internal-file set |
@@ -855,8 +896,10 @@ ATR, MTR, MBN, XI, TXP, and CMN do not have standalone CLI commands. They are ha
 | Option | Commands | Meaning |
 |---|---|---|
 | `--overwrite` | Every command that writes output | Replace existing same-named output |
-| `--res-version 0` | Operations containing RES | Write `CHRC00` |
-| `--res-version 1` | Operations containing RES | Write `CHRC01`; default |
+| `--res-version 0` | Operations converting RES | Write `CHRC00`; copied p00 is unaffected |
+| `--res-version 1` | Operations converting RES | Write `CHRC01`; default; copied p00 is unaffected |
+| `--copy-p00` | `character-xc` / `--auto` shorthand | Container-validate and preserve present p00; allow missing major slots; normally convert present p80/p84 |
+| `--auto` | Automatic shorthand; redundant with explicit `character-xc` | Dispatch the input/output form to the character-set operation |
 
 ### 23.3 Context for Single RES
 
@@ -872,7 +915,7 @@ The `res` command accepts `--context-dir`. If omitted, it searches the parent of
 
 | Function | Responsibility |
 |---|---|
-| `level5_decompress` | Decode kinds 1, 2, 3, and 4 |
+| `level5_decompress` | Decode kinds 0, 1, 2, 3, and 4 |
 | `level5_lz10_compress` | LZ10 for large rebuilt blocks |
 | `level5_lz10_compress_canonical` | LZ10 for XPCK name table and RES |
 | `unpack_xpck_archive` | Validate and extract XPCK |
@@ -894,7 +937,7 @@ The `res` command accepts `--context-dir`. If omitted, it searches the parent of
 | `convert_character_xi` | Validate and preserve XI |
 | `convert_character_txp` | Validate and preserve TXP |
 | `convert_character_cmn` | Validate and preserve CMN |
-| `convert_character_res` | CHRC02 RES to CHRC00/01 |
+| `convert_character_res` | Rebuild known CHRC00/01/02 RES as the selected CHRC00/01, using supplied reference context |
 
 ### 24.3 Sets and XC Archives
 
@@ -905,13 +948,13 @@ The `res` command accepts `--context-dir`. If omitted, it searches the parent of
 | `convert_p00_xc_archive` | Complete in-memory p00 XPCK conversion |
 | `convert_p8_xc_archive` | Complete in-memory p80/p84 XPCK conversion |
 | `character_archive_slot` | Determine slot from XC filename |
-| `find_character_xc_files` | Discover one character's three files |
-| `convert_character_xc_archives` | Convert three archives in memory |
-| `convert_character_xc_set` | Discover, convert, and write a three-file set |
+| `find_character_xc_files` | Discover one character's major files; complete trio by default, partial when explicitly allowed |
+| `convert_character_xc_archives` | Prepare a same-character major-XC set in memory; strict trio or explicit p00-copy subset |
+| `convert_character_xc_set` | Discover, prepare, and write the selected major-XC set |
 
 ## 25. Test Specification
 
-Tests live in `character_convert/test_*.py` and consist of 10 modules and 43 test methods.
+The test modules below belong to the private development workspace and are **not included in this public release**. The original extracted-fixture suite consisted of 10 modules and 43 methods; it is retained here as historical coverage. Current recovery and explicit-copy suites are described in Appendices M and C. Missing private extracted fixtures are not represented as passing historical tests. These module names describe verification evidence, not files or game samples shipped with a minimal checkout.
 
 | Test module | Main coverage |
 |---|---|
@@ -937,7 +980,7 @@ Tests distinguish between:
 
 ### 25.2 In-Game Validation
 
-Automatically converted `p00`, `p80`, and `p84` output has been confirmed in both an emulator and on real hardware. Automated tests establish structural correctness; model appearance, animation, and collision behavior must still be checked in game.
+The original automatically converted sample `p00`, `p80`, and `p84` sets were confirmed by the user in both an emulator and on real hardware. Later full-corpus variants and explicit-copy checks have structural or byte-preservation verification, not new all-corpus game confirmation. Automated tests establish implementation contracts; model appearance, animation, and collision behavior must still be checked in game.
 
 ## 26. Major Design Decisions
 
@@ -954,6 +997,8 @@ Official YWB1 pairs include vertex rounding, node additions/removals, LUT change
 ### 26.3 Validated Copy
 
 “Usable unchanged” does not mean “accept arbitrary input.” Only known layouts pass. A future unknown form is returned to analysis instead of silently copied.
+
+This statement applies to the per-format validators and strict internal conversion. Explicit whole-p00 preservation is a separate container-only policy described in Appendix C; it does not declare unknown model layouts supported by those validators.
 
 ### 26.4 Do Not Re-Round PRM
 
@@ -999,13 +1044,15 @@ MBN, TXP, and CMN reject NaN and infinity. Semantic value ranges are not guessed
 
 ## 28. Known Limitations
 
+The historical motion-file restriction below is superseded by [Appendix M](#appendix-m-full-corpus-motion-update). Unknown special types remain rejected; newly supported families do not imply arbitrary unknown-file copying.
+
 - Supported layouts are based on the analyzed corpus.
-- New ATR layout IDs, MBN flags, XI formats, and CMN types are rejected.
+- ATR is validated by decoded structure, not compressed file length. MBN flags outside 4/5/12, XI formats outside 0x1B/0x1C, and unverified CMN types are rejected.
 - Only zero is supported for the fourth MTN3 descriptor value.
 - MTNINF2 dynamic count is limited to zero or one.
 - XPCK is a flat file collection.
 - Filename CRC32 collisions are rejected rather than renamed.
-- p80/p84 content is limited to MTN3, MTNINF2, CMN, and RES.
+- p80/p84 additionally supports bundled MTM3/IMM3, their normal INF2 bundles, verified existing v2 animations/INF, and validated LKAT/SIL. See the full-corpus motion appendix for exact limits.
 - Some p00 field meanings remain unknown, but known structure is validated strictly enough to perform the compatibility conversion safely.
 
 ## 29. Adding a New Format Variant
@@ -1024,7 +1071,7 @@ When an unknown form is found, do not weaken validation before completing these 
 
 ## 30. Completion Criteria
 
-A character conversion is complete only when all of the following are true:
+A default strict three-archive conversion is complete only when all of the following are true. Explicit copy-mode completion follows [Appendix C](#appendix-c-explicit-p00-copy-and-auto-cli) instead and is not a claim that p00 internals were converted:
 
 - The p00, p80, and p84 base names match.
 - All three XC archives extract successfully.
@@ -1036,3 +1083,248 @@ A character conversion is complete only when all of the following are true:
 - Re-extracting each archive exactly reproduces its converted internal-file set.
 - All three archives are written under their input filenames in the requested output directory.
 - Final in-game testing confirms the model and relevant animations work correctly.
+
+## Appendix M: Full-Corpus Motion Update
+
+### M.1 Precedence and verification status
+
+**Full-corpus recovery supersedes the initial-only restrictions** on compression, motion families, bundle cardinality, and RES root construction in the main specification. Original sample counts and game-test results remain historical evidence. This appendix describes the implemented bytes-layer and archive-path behavior, not a claim that every new full-corpus output has been tested in game.
+
+Only p00/p80/p84 XC slots are in the requested full-corpus scope. Testing an existing p80 or p84 does not require its character to have the other two XCs. The independent `p8-xc` path and the corpus audit can process each present motion archive. Default character-set conversion remains a complete-trio operation. Explicit p00-copy mode now accepts available major slots as specified in [Appendix C](#appendix-c-explicit-p00-copy-and-auto-cli); it does not synthesize missing archives.
+
+Binary layout evidence and the detailed source/target tables are in [FORMAT_ANALYSIS.md, Appendix M](FORMAT_ANALYSIS.md#appendix-m-full-corpus-motion-update).
+
+### M.2 Shared decompression update
+
+`level5_decompress` accepts Level-5 kinds 0, 1, 2, 3, and 4. Kind 0 has the usual four-byte size/kind word, followed directly by the payload:
+
+```python
+kind = header & 7
+output_size = header >> 3
+require(output_size <= len(data) - 4, ...)
+decoded = data[4:4 + output_size]
+```
+
+It does not return trailing padding. Truncation remains an error, including a kind-0 block that advertises more bytes than are present. Unknown kinds remain errors. This change does not alter the LZ10/Huffman/RLE decoding algorithms or force shared-format copied files to change their compression.
+
+Generation-2 rebuilt animation blocks and special MINF blocks use the existing fast LZ10 encoder. XPCK filename tables and RES use the existing canonical LZ10 encoder. Logical equality, rather than compressed-byte identity, remains the comparison standard.
+
+### M.3 New motion bytes-layer functions
+
+| Function | Contract |
+|---|---|
+| `split_character_animation3(data, extension)` | Validate the source family's consecutive headers/body ranges/shared block and return conventional single-entry source payloads. |
+| `convert_character_animation3(data, extension)` | Return `list[bytes]`, one generation-2 payload for every logical MTN3/MTM3/IMM3 entry. |
+| `convert_mtn3_entries(data)` | MTN-specific list-returning wrapper around the family conversion function. |
+| `convert_simple_inf2(data, extension)` | Return ordinary MTMINF/IMMINF files only for exactly 68-byte source bodies and zero special-track counts. |
+| `validate_character_animation2(data, extension, *, allow_name_alias=False)` | Validate known MTN2/MTM2/IMM2 structures and return the original bytes. |
+| `validate_character_inf(data, extension)` | Validate known MTNINF/MTMINF/IMMINF structures, bounded logical-name CRC, and special regions, then return original bytes. |
+
+The supported generation-3 extensions are `.mtn3`, `.mtm3`, and `.imm3`. The target extensions are `.mtn2`, `.mtm2`, and `.imm2`, respectively. MTM/IMM support is integrated into `p8-content`, `p8-xc`, and automatic character conversion; no new standalone CLI command named `mtm3`, `imm3`, `mtminf2`, or `imminf2` is implied by adding these internal functions.
+
+`convert_mtn3(data) -> bytes` and the existing `mtn3` CLI preserve their established single-output contract. A source with multiple logical MTN entries must use the archive path or the list-returning API; one output path is not sufficient for that bundle.
+
+### M.4 Source splitting and target invariants
+
+The layout table fixes each family's magic, header size, track-category count, descriptor-count fields, used-length field, decoded-entry-base field, and target outer offsets. These are format parameters, not values inferred from a matching B1 character during conversion.
+
+Source splitting requires:
+
+1. At least one complete consecutive header with the correct family magic.
+2. Name/body regions contiguous in logical-header order.
+3. Pointer start exactly 48 bytes after that entry's name start; descriptor start exactly another `2 * track_count` bytes later.
+4. `u32@0x08` equal to `4 * hash_count + 8 * track_count`.
+5. All source descriptor tables in bounds before the shared compressed region.
+6. Ordered, nonoverlapping decoded-entry ranges containing their prefix and advertised used bytes.
+7. Zero-filled unclaimed decoded gaps and trailing padding in the bundled-splitting path.
+
+A verified single-entry source can reuse its original block instead of needlessly recompressing an intermediate source. The established ordinary single-MTN conversion path is retained for binary-output compatibility.
+
+For each logical entry, the target table positions are rebuilt from `H`, `T`, and `D`:
+
+```text
+pointer_start    = 12 + 4H
+record_start     = pointer_start + 2T
+descriptor_start = record_start + 8T
+data_start       = descriptor_start + 16D
+```
+
+Source hashes, track records, and exactly the claimed used-data bytes are preserved. The three descriptor data pointers are rebased by adding `data_start`; their fourth field must be zero. Source-relative pointers must lie inside the used-data area, and generated u16 track pointers must remain representable. The target work size is `len(target_raw) + 84D`. No unknown descriptor fields are silently cleared to recover an archive.
+
+Target animation validation independently checks the magic, reserved outer fields, name/compressed offsets, nonzero stored name identity, bounded readable-name termination, decoded three-word table header, track pointers, descriptor ranges/fourth fields, and work-size formula. Default legacy-copy validation also requires the readable name's CRC to equal the stored identity.
+
+### M.5 INF names, ordinary entries, and special entries
+
+MTMINF2/IMMINF2 reuse the existing MINF2 header/body parser, but their currently supported bodies must be exactly 68 bytes and have zero special-track count. The target common prefix, copied count word, and body produce exactly 96 bytes. A special or additional payload is rejected rather than passed through or stripped.
+
+`validate_character_inf` validates a nonempty logical name inside the **44-byte** target field `[0x20, 0x4C)`. It requires a NUL terminator within that interval and checks:
+
+```text
+u32(target, 0x1C) == CRC32(target[0x20 : first_NUL_inside_0x4C])
+```
+
+The raw byte sequence is used without a text-encoding round trip. The following root/playback fields are not searched for a terminator. This check applies equally to generated and byte-preserving copied INF files.
+
+For an ordinary INF entry, total size must be 96 bytes and work size must be zero. Only MTNINF may currently contain special data. Its validator requires a complete 44-byte-per-track descriptor table; in-bounds records at least 48 bytes long; dynamic count 0 or 1; the expected data pointer; marker `0x00010000`; zero-reserved descriptor words; and `work_size = len(special_raw) + 128 * track_count`.
+
+The special MTNINF2 supported set now includes the original fixed, A=8, and A=12 forms plus **A=4 with event/type `0x05E4` only**. The event code is the last u32 in the matching 12-byte fixed value. This additional form still requires `D=1`, `C=B+4`, auxiliary value 4, and valid shared-data bounds. Its verified four-byte non-string payload is not subject to the string NUL requirement. All output-position and work-size formulas are unchanged.
+
+Two different forms remain rejected: `x611000_p80/000.mtninf2` A=4/event `0x044E` with auxiliary value 0, and `x791000_p84/000.mtninf2` A=16. Both lack an established B1 rule. No fallback strips their special information or changes them into the known event type.
+
+### M.6 Current p80/p84 file-set contract
+
+`convert_p8_internal_files` retains its signature and now accepts these known internal suffixes in addition to exactly one `RES.bin`:
+
+```text
+Generation-3 animation bundles: mtn3, mtm3, imm3
+Generation-2 animation files:   mtn2, mtm2, imm2
+Information bundles:           mtninf2, mtminf2, imminf2
+Individual information files:  mtninf, mtminf, imminf
+Optional shared resources:     cmn, lkat, sil
+```
+
+Every filename must remain a safe direct-child name. Numbered animation/INF filenames must be consecutive from `000` within their own extension. At most one generation-3 physical bundle is allowed per family; the same family cannot mix that source bundle and pre-existing generation-2 files. The equivalent no-mixing rule applies to INF2 bundles and individual old INF files. At least one MTN animation source (`mtn3` or `mtn2`) and MTN information source (`mtninf2` or `mtninf`) are required. Optional IMM/MTM families are processed when present rather than imposed on every character.
+
+Processing order is:
+
+1. Convert each generation-3 animation family into numbered generation-2 outputs, or validate and preserve existing generation-2 files.
+2. Convert each supported INF2 family into numbered individual outputs, or validate and preserve individual old INF files.
+3. Validate CMN and SIL; convert LKAT with its established standalone rule.
+4. Rebuild RES using all generated/copied animation/INF outputs and the source INF2 bundles.
+5. Repack and verify the converted file set through the existing XPCK layer.
+
+Logical order is preserved independently for each extension. Output filename collisions are errors. Exceptions from bundle conversions identify the source internal filename. Unknown suffixes remain errors; extension recognition is not an unrestricted copy fallback.
+
+### M.7 Expanded RES API and category reconstruction
+
+The current bytes-layer signature is:
+
+```python
+convert_character_res(
+    data: bytes,
+    mtninf2_data: bytes | None = None,
+    version: int = 1,
+    *,
+    animation_files: dict[str, bytes] | None = None,
+    inf2_files: dict[str, bytes] | None = None,
+) -> bytes
+```
+
+In the archive path, `animation_files` contains the converted/copied generation-2 animation and individual INF outputs; optional other converted files in that dictionary do not become animation roots. `inf2_files` contains the original `.mtninf2`, `.mtminf2`, and `.imminf2` bundles. A supplied positional `mtninf2_data` must not conflict with the bundle dictionary.
+
+| Family | New type | Old type | Old reference identity |
+|---|---:|---:|---|
+| MTN | `0x012D` | `0x012C` | Stored MTN2 ID at `0x28` |
+| IMM | `0x0137` | `0x0136` | Stored IMM2 ID at `0x24` |
+| MTM | `0x0141` | `0x0140` | Stored MTM2 ID at `0x24` |
+| MTNINF | `0x0191` | `0x0190` | Bounded logical-name CRC |
+| IMMINF | `0x019B` | `0x019A` | Bounded logical-name CRC |
+| MTMINF | `0x01A5` | `0x01A4` | Bounded logical-name CRC |
+
+Every new category must have one physical 28-byte source record. That one record expands into an 8-byte `(identity, 0)` record for each logical output in the corresponding family. The count is the number of actual logical outputs, not the number of physical source files. `out_00` is not substituted for other roots in the archive path.
+
+The converter rejects duplicate old/new category sections, wrong new strides/counts, wrong legacy strides/nonzero reserved words, and mismatched converted-file category presence, count, order, or identities. The rebuilt INF references must match the validated generated/copied individual INF names. An already-old category is checked against the current files rather than blindly trusted. Existing strings retain their order; missing logical/readable names are appended.
+
+CHRC00/CHRC01 inputs are supported without another generation downgrade. Old internal v2/INF payloads remain byte-identical after validation; RES is parsed, checked, and reserialized with the selected version. This does not promise unconditional byte identity of old RES serialization. CHRC01 remains the default, CHRC00 remains selectable, and the serializer uses the same structure for both versions with their respective magic.
+
+The old positional-only RES API preserves the initial MTN `out_00` compatibility behavior. The `res` CLI still searches only for a sibling/context `.mtninf2`; it is not automatically a complete source of multi-family or multi-root animation context. Use `p8-content`, `p8-xc`, or automatic character conversion for those full-archive cases, or call the expanded bytes API with both dictionaries. Merely passing one RES.bin to the old standalone command is not equivalent to converting its entire XC.
+
+### M.8 Source aliases and the stored-ID decision
+
+The official YW3 y699000 IMM bundles are renamed copies of y159000 bundles: reversing the readable-name substitution yields exact byte equality, including the stored identities, descriptors, and shared block. Recalculating those identities from the renamed readable strings would change the source identity and its references.
+
+Generation conversion therefore preserves both the stored nonzero identity and readable name. Generated-v2 validation calls `validate_character_animation2(..., allow_name_alias=True)`. RES context validation permits the same source-alias condition when INF2 bundle context is supplied and writes actual stored animation IDs into the old references. Existing-v2 file copying uses the default strict name-CRC check. INF logical-name CRC validation remains strict; this option is not a blanket waiver for all names or reference errors.
+
+This policy is an inference grounded in official renamed source resources and the shared binary placement, not a same-name B1 comparison or demonstrated B1 game success for y699000. The new alias outputs remain a priority for game testing. The stored ID is never repaired by guessing a replacement character prefix.
+
+### M.9 Current regression coverage and failure policy
+
+`test_character_motion_recovery.py` covers kind 0, all three synthetic bundled layouts, preservation of claimed source data, invalid body/gap rejection, unknown descriptor extras, exact ordinary INF sizing, corrupt legacy-animation rejection, actual MTN splitting, exact official MTM/IMM and A=4 reconstruction, source alias preservation, and continued failure of the two unresolved special types.
+
+`test_character_archive_recovery.py` adds the integrated family/RES and stricter bounded-INF checks used for full-corpus recovery. ROM-dependent historical tests need their original private extracted fixtures; a missing fixture must not be reported as a proven format regression or a passing corpus comparison.
+
+The corpus verifier processes each present XC independently, preserves original inputs, and checks conversion, selected RES magic, absence of newer animation extensions, XPCK repack/re-extraction equality, and output hashes when written. A successful companion slot does not make a failed slot successful. A missing slot is not created. A structural success is not a promise of correct appearance, playback, attachments, or other in-game behavior.
+
+Unknown special forms stay conversion failures until an old-format comparison or controlled game experiment establishes a safe rule. The converter does not silently switch from failure to feature deletion; any future stripping policy would need a separate explicit design and implementation decision.
+
+## Appendix C: Explicit p00 Copy and Auto CLI
+
+### C.1 Policy selection, not failure fallback
+
+The default behavior remains strict p00/p80/p84 conversion with a complete same-character trio. `--copy-p00` is an explicit alternate workflow: copy a present p00 **even when strict conversion could succeed**, and normally convert every selected p80/p84. It neither attempts model conversion nor falls back silently after an error.
+
+The project author reports that unmodified YW3 p00 can run in B1. This motivates an explicit preservation option, but is author-provided evidence rather than new game verification by the converter developers. The 104 unresolved p00 cases in the historical strict audit remain **unsupported internal conversion cases**, not a verdict that their original archives cannot be transplanted unchanged.
+
+### C.2 Bytes-layer and discovery contracts
+
+```python
+find_character_xc_files(input_path, *, allow_partial=False) -> dict[str, Path]
+convert_character_xc_archives(archives, res_version=1, *, copy_p00=False) -> dict[str, bytes]
+convert_character_xc_set(input_path, output_dir, res_version=1, overwrite=False, *, copy_p00=False) -> list[Path]
+```
+
+The set I/O function passes `allow_partial=copy_p00` into discovery and the same policy into the bytes layer. In normal mode, exactly three major archives are required. In copy mode, 1–3 are accepted. Both modes reject unsafe names, duplicate major slots, and selected major files with different case-insensitive character base names.
+
+Directory discovery ignores non-major XC slots in both modes, including normal ROM directories that contain p10/p20 alongside the major trio. It rejects directories containing major slots for multiple characters. File discovery requires a major XC filename and selects only same-base major siblings. Neither mode recursively discovers every character or accepts a non-major selected file as a substitute.
+
+### C.3 Copy validation and exact preservation
+
+For a present p00 in copy mode, the bytes layer calls `unpack_xpck_archive` solely to validate the container, then returns the **original input archive bytes**. The unpacked dictionary is not passed to `convert_p00_internal_files` or the XPCK packer.
+
+Container checks still include XPCK framing/ranges, filename decoding and CRCs, unique safe names, known RES compression and expanded CHRC magic, and the established archive placement/padding checks. Copy mode is not permission to copy a malformed container. It does not validate model semantics, PRM compatibility blocks, bone hierarchies, texture forms, LKAT internals, or the p00 RES reference graph.
+
+Every original p00 byte is retained: compressed bytes, file order, internal filenames, unknown internal resources, RES generation, and archive padding. `--res-version 0/1` is applied only to converted motion slots in this mode. A source p00 with CHRC02 remains CHRC02; no claim of p00 CHRC00/01 output is made. Default strict p00 and standalone `p00-xc`/`p00-content` behavior is unchanged.
+
+### C.4 Partial sets
+
+Copy mode processes only present major slots:
+
+| Selected input | Output |
+|---|---|
+| p00 only | One exact container-validated p00 copy |
+| p00 plus p80 or p84 | Copy p00 and convert the present motion slot |
+| p80 and/or p84 without p00 | Convert the present motion files; create no p00 |
+| Complete trio | Copy p00 and convert both motion files |
+| No major XC | Error |
+
+This policy does not fill missing slots with B1 templates, rename another archive into a missing slot, or copy a failed motion file.
+
+### C.5 Short automatic CLI
+
+The normalization in `main` recognizes one `--auto` before the option terminator, removes it, and dispatches a bare input/output invocation to `character-xc`. More than one `--auto` is a usage error. Explicit `character-xc ... --auto` is accepted but redundant; another subcommand combined with `--auto` is a usage error.
+
+Equivalent copy selections:
+
+```powershell
+python character_converter.py INPUT OUTPUT_DIRECTORY --auto --copy-p00
+python character_converter.py character-xc INPUT OUTPUT_DIRECTORY --copy-p00
+```
+
+`--copy-p00` is an option of the character-set workflow, not of `p00-xc`, `p8-xc`, or internal-format commands. Existing overwrite, output-directory, filename, source-protection, and RES-version arguments retain their contracts. The short form adds no separate conversion implementation.
+
+### C.6 Failure and writing guarantees
+
+The chosen p00 operation and all selected motion conversions complete in memory before output staging. A malformed copied p00 container or any selected motion conversion error aborts the operation before new final files are written; pre-existing outputs remain untouched by that format error. `--overwrite` does not suppress validation errors and never authorizes modifying the source.
+
+After preparation succeeds, the existing staged writing logic handles all selected 1–3 outputs under their original filenames. Its existing OS-level limitation remains: replacing several files in an already-existing destination directory is not a filesystem transaction, so an OS failure during replacement is distinct from an ordinary pre-write format failure.
+
+### C.7 Motion failures remain strict
+
+| XC | Problem internal file | Unsupported special form |
+|---|---|---|
+| `x611000_p80.xc` | `000.mtninf2` | Entry 2 descriptor 0: A=4/event `0x044E`, auxiliary value 0 |
+| `x791000_p84.xc` | `000.mtninf2` | Entry 5 descriptor 0: A=16 |
+
+Both remain conversion errors even with `--copy-p00`. Motion data is neither copied nor stripped as a fallback. Selecting either archive prevents new output of the entire selected set, including an otherwise valid p00 copy.
+
+### C.8 Completion and runtime evidence
+
+A successful copy-mode run means that the selected major filenames/bases were valid; every present p00 container passed the container checks and was preserved exactly; every present p80/p84 passed the normal conversion/repack checks; and the selected outputs were written under their original names. It does not mean all three slots existed, all RES files were downgraded, p00 model internals were supported, or every output works in B1.
+
+The copy-mode CLI explicitly identifies p00 as `copied unchanged` or `not present` and lists only written files. The selected CHRC version in that message describes converted motion files, not copied p00. Hash equality verifies the copying contract; controlled game testing is still necessary for compatibility, appearance, attachments, and motion behavior.
+
+### C.9 Copy-mode regression evidence
+
+On 2026-10-15, all 104 historically unresolved p00 cases were exercised in memory with explicit copy mode. Each output p00 exactly matched the entire original XC byte sequence. Their available-slot compositions were 103 p00-only sets and one complete trio (`y740000`); present motion outputs matched ordinary motion conversion, and missing slots were not created. This verification did not save new XC files or modify source ROM/previous converted XCs, and it was not a game test.
+
+`test_character_p00_copy.py` adds copy/partial/CLI/discovery, preservation, source-protection, and failure-policy regression coverage. The new 28 tests and the existing 39 recovery tests passed together (67 total). These checks verify implementation contracts; they do not establish runtime compatibility of all copied model internals.

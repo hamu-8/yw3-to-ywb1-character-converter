@@ -12,12 +12,16 @@ converted*/
 test_output/
 yw3/
 ywb1/
+rom/
 *_content/
 
 # Extracted game-resource formats
 *.xc
+*.xv
+*.xr
 RES.bin
 *.prm
+*.prmgrp
 *.mtn2
 *.mtn3
 *.mtninf
